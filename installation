@@ -1,0 +1,807 @@
+# Kubernetes HA Cluster Installation Guide
+
+**3 control-plane (master) nodes + worker nodes, Ubuntu, kubeadm, containerd, Calico, HAProxy + keepalived**
+
+This guide builds a highly available Kubernetes cluster where any one master can fail without taking down the cluster. Every command block states which node(s) it runs on. Every step explains why it is needed.
+
+---
+
+## Table of contents
+
+1. [Architecture](#1-architecture)
+2. [Values to change before you start](#2-values-to-change-before-you-start)
+3. [Which step runs on which node](#3-which-step-runs-on-which-node)
+4. [DNS records to request](#4-dns-records-to-request)
+5. [Step 1 — Prepare all nodes](#5-step-1--prepare-all-nodes)
+6. [Step 2 — Load balancer on the three masters](#6-step-2--load-balancer-on-the-three-masters)
+7. [Step 3 — Initialize the cluster on master1](#7-step-3--initialize-the-cluster-on-master1)
+8. [Step 4 — Install Calico on master1](#8-step-4--install-calico-on-master1)
+9. [Step 5 — Join master2 and master3](#9-step-5--join-master2-and-master3)
+10. [Step 6 — Join the workers](#10-step-6--join-the-workers)
+11. [Step 7 — Verify the cluster](#11-step-7--verify-the-cluster)
+12. [Step 8 — Access from your workstation](#12-step-8--access-from-your-workstation)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Reference: ports](#14-reference-ports)
+15. [Reference: how to add a node later](#15-reference-how-to-add-a-node-later)
+
+---
+
+## 1. Architecture
+
+```
+                         kubectl / workers / kubelets
+                                     |
+                                     v
+                    +-------------------------------+
+                    |   k8s-api.corp.example.com     |
+                    |   Virtual IP 192.168.1.100     |
+                    |   keepalived (VRRP) + HAProxy  |
+                    |   listens on :8443             |
+                    +---------------+---------------+
+                                    |
+              +---------------------+---------------------+
+              |                     |                     |
+              v                     v                     v
+     +----------------+   +----------------+   +----------------+
+     |    master1     |   |    master2     |   |    master3     |
+     |  192.168.1.11  |   |  192.168.1.12  |   |  192.168.1.13  |
+     |  kube-apiserver|   |  kube-apiserver|   |  kube-apiserver|
+     |  etcd member   |   |  etcd member   |   |  etcd member   |
+     |  scheduler     |   |  scheduler     |   |  scheduler     |
+     |  ctrl-manager  |   |  ctrl-manager  |   |  ctrl-manager  |
+     |  haproxy       |   |  haproxy       |   |  haproxy       |
+     |  keepalived    |   |  keepalived    |   |  keepalived    |
+     +----------------+   +----------------+   +----------------+
+              \                     |                     /
+               \                    |                    /
+                +-------- etcd cluster (quorum 2 of 3) --+
+                                    |
+              +---------------------+---------------------+
+              v                                           v
+     +----------------+                         +----------------+
+     |    worker1     |                         |    worker2     |
+     |  192.168.1.21  |                         |  192.168.1.22  |
+     |  kubelet       |                         |  kubelet       |
+     |  containerd    |                         |  containerd    |
+     |  calico-node   |                         |  calico-node   |
+     +----------------+                         +----------------+
+```
+
+**Why three masters?** Cluster state lives in `etcd`, which needs a majority (quorum) of members to agree before writing. With 3 members, one can fail and 2 of 3 still form a majority. With 2 members, losing one leaves 1 of 2, which is not a majority, so the cluster freezes. Always use an odd number: 3 or 5.
+
+**Why a load balancer?** Every worker, every kubelet and your `kubectl` need one stable address for "the API server". If that address were master1's IP, master1 dying would blind the whole cluster even though masters 2 and 3 are healthy. keepalived floats a virtual IP (VIP) to a surviving master; HAProxy on that master spreads requests across all three API servers.
+
+**Why Calico?** Kubernetes does not ship with pod networking. Calico provides it and also enforces `NetworkPolicy` (firewall rules between pods), which simpler plugins like Flannel do not.
+
+---
+
+## 2. Values to change before you start
+
+Search and replace these throughout the document.
+
+| Placeholder in this guide | Meaning | Your value |
+|---|---|---|
+| `corp.example.com` | Your organisation's DNS domain | |
+| `192.168.1.0/24` | Node network | |
+| `192.168.1.1` | Default gateway | |
+| `192.168.1.100` | Virtual IP for the API (must be free, same subnet as masters) | |
+| `192.168.1.11 / .12 / .13` | master1 / master2 / master3 | |
+| `192.168.1.21 / .22` | worker1 / worker2 | |
+| `10.10.10.53, 10.10.10.54` | Your organisation's DNS servers | |
+| `ens18` | Network interface name on the nodes (`ip a` to find it) | |
+| `10.244.0.0/16` | Pod network. Must NOT overlap with any real network you use | |
+| `v1.36` | Kubernetes minor version. Check https://kubernetes.io/releases/ | |
+| `v3.32.2` | Calico version. Check https://github.com/projectcalico/calico/releases | |
+
+**Hardware minimums:** masters 2 CPU / 4 GB RAM / 40 GB disk; workers 2 CPU / 2 GB RAM. All nodes: Ubuntu 22.04 or 24.04, static IP, internet access (for packages and images), unique hostname, unique MAC address.
+
+---
+
+## 3. Which step runs on which node
+
+| Step | master1 | master2 | master3 | worker1 | worker2 | Workstation |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| DNS records (request from DNS team) | | | | | | request |
+| Step 1 — Prepare node | yes | yes | yes | yes | yes | |
+| Step 2 — HAProxy + keepalived | yes | yes | yes | | | |
+| Step 3 — `kubeadm init` | **yes only** | | | | | |
+| Step 4 — Calico | **yes only** | | | | | |
+| Step 5 — Join as control plane | | yes | yes | | | |
+| Step 6 — Join as worker | | | | yes | yes | |
+| Step 7 — Verify | any one master | | | | | |
+| Step 8 — kubectl access | | | | | | yes |
+
+Order matters: finish Step 1 on **all** nodes before Step 2. Finish Step 4 before Step 5. Join masters one at a time.
+
+---
+
+## 4. DNS records to request
+
+> **Who:** send this to your DNS administrator. Nothing to run on the nodes yet.
+
+The cluster will be bound to the name `k8s-api.corp.example.com`. It must resolve before Step 3.
+
+### Forward zone `corp.example.com` — A records
+
+| Hostname | Type | Value | Purpose |
+|---|---|---|---|
+| k8s-api | A | 192.168.1.100 | Virtual IP, Kubernetes API endpoint |
+| master1 | A | 192.168.1.11 | Control plane node |
+| master2 | A | 192.168.1.12 | Control plane node |
+| master3 | A | 192.168.1.13 | Control plane node |
+| worker1 | A | 192.168.1.21 | Worker node |
+| worker2 | A | 192.168.1.22 | Worker node |
+
+### Reverse zone `1.168.192.in-addr.arpa` — PTR records
+
+| Last octet | Type | Value |
+|---|---|---|
+| 100 | PTR | k8s-api.corp.example.com. |
+| 11 | PTR | master1.corp.example.com. |
+| 12 | PTR | master2.corp.example.com. |
+| 13 | PTR | master3.corp.example.com. |
+| 21 | PTR | worker1.corp.example.com. |
+| 22 | PTR | worker2.corp.example.com. |
+
+### Same records in BIND zone-file format
+
+```
+; forward zone: corp.example.com
+k8s-api   IN  A    192.168.1.100
+master1   IN  A    192.168.1.11
+master2   IN  A    192.168.1.12
+master3   IN  A    192.168.1.13
+worker1   IN  A    192.168.1.21
+worker2   IN  A    192.168.1.22
+
+; reverse zone: 1.168.192.in-addr.arpa
+100       IN  PTR  k8s-api.corp.example.com.
+11        IN  PTR  master1.corp.example.com.
+12        IN  PTR  master2.corp.example.com.
+13        IN  PTR  master3.corp.example.com.
+21        IN  PTR  worker1.corp.example.com.
+22        IN  PTR  worker2.corp.example.com.
+```
+
+For Windows DNS: create each as "New Host (A or AAAA)" in the `corp.example.com` zone with "Create associated pointer (PTR) record" ticked. The reverse lookup zone `1.168.192.in-addr.arpa` must exist first.
+
+Request a TTL of **300 seconds** on `k8s-api` so the VIP can be moved later without long cache delays.
+
+**Why DNS instead of `/etc/hosts`?** A hosts file must be edited on every machine for every change, does not help pods inside the cluster, and does not help your workstation. Putting the API endpoint behind a DNS name also means you can move the load balancer to a different IP later without re-issuing cluster certificates.
+
+### Verify (from any machine on the network)
+
+```bash
+dig k8s-api.corp.example.com +short     # expected: 192.168.1.100
+dig -x 192.168.1.11 +short              # expected: master1.corp.example.com.
+```
+
+---
+
+## 5. Step 1 — Prepare all nodes
+
+> **Run on:** master1, master2, master3, worker1, worker2 (every node)
+
+### 1.1 Set the hostname
+
+Change the name per node.
+
+```bash
+sudo hostnamectl set-hostname master1.corp.example.com
+```
+
+**Why:** The kubelet registers each node under its hostname, so names must be unique. Using the full FQDN makes the Kubernetes node name match DNS forward and reverse records, which avoids confusion in logs and certificate checks later.
+
+### 1.2 Configure static IP, DNS servers and search domain
+
+Find the netplan file name with `ls /etc/netplan/`, then write it (example for master1; change `addresses` per node):
+
+```bash
+cat <<EOF | sudo tee /etc/netplan/00-installer-config.yaml
+network:
+  version: 2
+  ethernets:
+    ens18:
+      addresses: [192.168.1.11/24]
+      routes:
+        - to: default
+          via: 192.168.1.1
+      nameservers:
+        addresses: [10.10.10.53, 10.10.10.54]
+        search: [corp.example.com]
+EOF
+sudo netplan apply
+```
+
+Verify:
+
+```bash
+getent hosts k8s-api       # expected: 192.168.1.100 k8s-api.corp.example.com
+hostname -f                # expected: master1.corp.example.com
+ping -c1 google.com        # internet works
+```
+
+**Why:** Static IPs are mandatory. If DHCP ever changed a master's IP, etcd and the API server certificates would break. The `search` domain lets you type `k8s-api` and have it expand to the FQDN. If your organisation hands out static leases and DNS via DHCP, you can skip this file; just confirm the `getent` and `hostname -f` output.
+
+### 1.3 Disable swap
+
+```bash
+sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
+```
+
+**Why:** The kubelet enforces pod memory limits. With swap enabled, a pod can exceed its limit and spill to disk, which makes limits meaningless and performance unpredictable. The kubelet refuses to start if swap is on. The `sed` keeps swap off after reboot.
+
+### 1.4 Kernel modules and sysctl settings
+
+```bash
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sudo sysctl --system
+```
+
+**Why:**
+- `overlay` is the filesystem containerd uses to stack container image layers.
+- `br_netfilter` and the `bridge-nf-call-*` settings make traffic crossing a Linux bridge visible to iptables, which kube-proxy (Services) and Calico (NetworkPolicy) depend on.
+- `ip_forward` lets the node route packets between pods and the outside world. Without it each node is a dead end.
+
+### 1.5 Install containerd (container runtime)
+
+```bash
+sudo apt-get update
+sudo apt-get install -y containerd
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+```
+
+Verify:
+
+```bash
+sudo systemctl is-active containerd          # active
+grep SystemdCgroup /etc/containerd/config.toml   # SystemdCgroup = true
+```
+
+**Why:** Kubernetes does not run containers itself; it instructs a runtime through the CRI interface. containerd is the lightweight standard. `SystemdCgroup = true` is critical: Ubuntu manages cgroups with systemd and so does the kubelet by default. If containerd used a different cgroup driver, two managers would fight over resource accounting and nodes would randomly go `NotReady`.
+
+### 1.6 Install kubeadm, kubelet and kubectl
+
+```bash
+sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+sudo systemctl enable --now kubelet
+```
+
+Verify:
+
+```bash
+kubeadm version -o short     # same version on every node
+```
+
+**Why:**
+- `kubeadm` bootstraps the cluster. `kubelet` is the agent on every node that starts and watches pods. `kubectl` is the command-line client.
+- `apt-mark hold` stops a routine `apt upgrade` from changing the Kubernetes version. Kubernetes upgrades must be done deliberately, masters first, one minor version at a time.
+- The kubelet will crash-loop until `kubeadm init` or `kubeadm join` gives it a configuration. That is expected.
+- The `v1.36` in the repo URL selects the minor version line. All nodes must run the same version.
+
+### 1.7 Firewall
+
+For a lab you can simply disable it:
+
+```bash
+sudo ufw disable
+```
+
+For production, open only the required ports (see [Reference: ports](#14-reference-ports)):
+
+```bash
+# On masters:
+sudo ufw allow 6443,8443,2379:2380,10250,10257,10259,179,5473/tcp
+sudo ufw allow 4789/udp
+sudo ufw allow from 192.168.1.0/24 to any port 112 proto vrrp   # only if ufw blocks VRRP; see note
+
+# On workers:
+sudo ufw allow 10250,30000:32767,179,5473/tcp
+sudo ufw allow 4789/udp
+```
+
+> Note: keepalived uses VRRP (IP protocol 112, multicast 224.0.0.18). Some firewalls block it. If the VIP appears on more than one master at once in Step 2, VRRP is being blocked between them.
+
+**Why:** 179/tcp is Calico BGP (route distribution between nodes), 4789/udp is Calico VXLAN (pod traffic across subnets), 5473 is Calico Typha. If these are blocked, pods on different nodes cannot talk to each other even though everything shows `Running`.
+
+---
+
+## 6. Step 2 — Load balancer on the three masters
+
+> **Run on:** master1, master2, master3 (not on workers)
+
+### 2.1 Install packages
+
+```bash
+sudo apt-get install -y haproxy keepalived
+```
+
+### 2.2 HAProxy configuration (identical on all three masters)
+
+```bash
+cat <<EOF | sudo tee /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
+    daemon
+
+defaults
+    mode tcp
+    log global
+    option tcplog
+    timeout connect 10s
+    timeout client  1m
+    timeout server  1m
+
+frontend k8s-api
+    bind *:8443
+    default_backend k8s-api
+
+backend k8s-api
+    balance roundrobin
+    option httpchk GET /healthz
+    http-check expect status 200
+    server master1 192.168.1.11:6443 check check-ssl verify none
+    server master2 192.168.1.12:6443 check check-ssl verify none
+    server master3 192.168.1.13:6443 check check-ssl verify none
+EOF
+sudo systemctl restart haproxy && sudo systemctl enable haproxy
+```
+
+**Why:**
+- Port **8443**: the Kubernetes API server already listens on 6443 on these same machines, so HAProxy needs a different port.
+- `mode tcp`: the API server uses mutual TLS. HAProxy must pass the encrypted stream through untouched; it cannot terminate TLS.
+- The `/healthz` check removes a dead API server from rotation within seconds.
+- Backends are written as **IP addresses on purpose**. The load balancer keeps the API reachable, so it must never depend on DNS being up.
+
+### 2.3 keepalived health check script (identical on all three masters)
+
+```bash
+cat <<EOF | sudo tee /etc/keepalived/check_apiserver.sh
+#!/bin/sh
+curl -sfk --max-time 2 https://localhost:8443/healthz -o /dev/null || exit 1
+EOF
+sudo chmod +x /etc/keepalived/check_apiserver.sh
+```
+
+**Why:** keepalived runs this every few seconds. If the local HAProxy stops answering, the node's priority is lowered and the VIP moves to another master.
+
+### 2.4 keepalived configuration (differs per master)
+
+Set `interface` to your NIC name (`ip a`). Set `state` and `priority` per node:
+
+| Node | `state` | `priority` |
+|---|---|---|
+| master1 | MASTER | 101 |
+| master2 | BACKUP | 100 |
+| master3 | BACKUP | 99 |
+
+```bash
+cat <<EOF | sudo tee /etc/keepalived/keepalived.conf
+vrrp_script check_apiserver {
+    script "/etc/keepalived/check_apiserver.sh"
+    interval 3
+    weight -2
+    fall 10
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface ens18
+    virtual_router_id 51
+    priority 101
+    authentication {
+        auth_type PASS
+        auth_pass k8s-vip
+    }
+    virtual_ipaddress {
+        192.168.1.100
+    }
+    track_script {
+        check_apiserver
+    }
+}
+EOF
+sudo systemctl restart keepalived && sudo systemctl enable keepalived
+```
+
+**Why:** VRRP elects the node with the highest priority to hold the VIP. When the health check fails, `weight -2` drops that node's priority below the next one and the VIP moves. `virtual_router_id` must be unique on your LAN if other keepalived clusters exist on the same network. `auth_pass` must be identical on all three.
+
+### 2.5 Verify
+
+```bash
+# master1:
+ip a | grep 192.168.1.100          # VIP present
+# master2 and master3:
+ip a | grep 192.168.1.100          # nothing (VIP is on master1)
+```
+
+Quick failover test of the load balancer alone:
+
+```bash
+# master1:
+sudo systemctl stop keepalived
+# master2:
+ip a | grep 192.168.1.100          # VIP has moved here
+# master1:
+sudo systemctl start keepalived    # VIP returns to master1 (higher priority)
+```
+
+---
+
+## 7. Step 3 — Initialize the cluster on master1
+
+> **Run on:** master1 ONLY
+
+### 3.1 kubeadm init
+
+```bash
+sudo kubeadm init \
+  --control-plane-endpoint "k8s-api.corp.example.com:8443" \
+  --upload-certs \
+  --pod-network-cidr=10.244.0.0/16 \
+  --apiserver-advertise-address=192.168.1.11
+```
+
+This takes 1 to 3 minutes.
+
+**Why each flag:**
+- `--control-plane-endpoint`: the single most important flag for HA. It puts the load balancer name into the API server certificate and every kubelet config. Without it the cluster is permanently tied to master1's IP and can never be made highly available.
+- `--upload-certs`: encrypts the cluster CA certificates and stores them in a Kubernetes Secret, so the other masters can download them during join instead of you copying `/etc/kubernetes/pki` by hand.
+- `--pod-network-cidr`: the IP range pods will use. Calico reads this in Step 4. It must not overlap any real network.
+- `--apiserver-advertise-address`: binds the API server to the correct interface if the machine has more than one.
+
+### 3.2 Save the join commands
+
+The end of the output contains two commands. **Copy both into a safe place.** They look like:
+
+```
+You can now join any number of control-plane nodes running the following command on each as root:
+
+  kubeadm join k8s-api.corp.example.com:8443 --token abcdef.0123456789abcdef \
+    --discovery-token-ca-cert-hash sha256:1234567890abcdef... \
+    --control-plane --certificate-key f8902e114ef118304e561c3ecd4d0b543adc226b7a07f675f56564185ffe0c07
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+  kubeadm join k8s-api.corp.example.com:8443 --token abcdef.0123456789abcdef \
+    --discovery-token-ca-cert-hash sha256:1234567890abcdef...
+```
+
+The **token** expires after 24 hours and the **certificate-key** after 2 hours. See [Troubleshooting](#13-troubleshooting) to regenerate them.
+
+### 3.3 Configure kubectl for your user
+
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+kubectl get nodes
+```
+
+Expected output:
+
+```
+NAME                        STATUS     ROLES           AGE   VERSION
+master1.corp.example.com    NotReady   control-plane   1m    v1.36.x
+```
+
+**Why `NotReady`:** the node is healthy but has no pod network yet. The kubelet reports `NotReady` until a CNI plugin is installed, and CoreDNS pods stay `Pending` for the same reason. Step 4 fixes this.
+
+---
+
+## 8. Step 4 — Install Calico on master1
+
+> **Run on:** master1 ONLY (kubectl commands; they apply cluster-wide)
+
+### 4.1 Install the Tigera operator
+
+```bash
+CALICO=v3.32.2
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/$CALICO/manifests/operator-crds.yaml
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/$CALICO/manifests/tigera-operator.yaml
+```
+
+### 4.2 Configure the pod network CIDR and install Calico
+
+```bash
+curl -O https://raw.githubusercontent.com/projectcalico/calico/$CALICO/manifests/custom-resources.yaml
+sed -i 's|192.168.0.0/16|10.244.0.0/16|' custom-resources.yaml
+grep cidr custom-resources.yaml          # confirm: cidr: 10.244.0.0/16
+kubectl create -f custom-resources.yaml
+```
+
+### 4.3 Wait and verify
+
+```bash
+watch kubectl get pods -n calico-system      # wait until all Running, then Ctrl+C
+kubectl get tigerastatus                     # AVAILABLE = True for all
+kubectl get nodes                            # master1 now Ready
+kubectl get pods -n kube-system              # coredns pods Running
+```
+
+**Why:**
+- Calico is installed through the **Tigera operator**, a controller that deploys Calico, keeps it healthy and handles upgrades. Order is: CRDs first, then the operator, then the `Installation` resource (`custom-resources.yaml`) that tells the operator what to deploy.
+- The `sed` changes Calico's default pod CIDR (`192.168.0.0/16`) to match `--pod-network-cidr` from Step 3. Calico's default would collide with a `192.168.x.x` office network. If the two CIDRs do not match, pods get IPs the controller manager does not know about and networking breaks in confusing ways.
+- `kubectl create` is used instead of `kubectl apply` because the operator manifest is too large for the annotation that `apply` adds.
+- Calico runs a `calico-node` pod on every node automatically (it is a DaemonSet), so no per-node network configuration is needed when you add masters and workers later.
+
+---
+
+## 9. Step 5 — Join master2 and master3
+
+> **Run on:** master2 first. Wait until it is `Ready`. Then master3.
+
+### 5.1 Join as a control-plane node
+
+Use the **control-plane join command** saved in Step 3.2 and add `--apiserver-advertise-address` with that node's own IP:
+
+```bash
+# master2:
+sudo kubeadm join k8s-api.corp.example.com:8443 --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane --certificate-key <key> \
+  --apiserver-advertise-address=192.168.1.12
+
+# master3 (after master2 is Ready):
+sudo kubeadm join k8s-api.corp.example.com:8443 --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane --certificate-key <key> \
+  --apiserver-advertise-address=192.168.1.13
+```
+
+### 5.2 Configure kubectl on each new master
+
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+kubectl get nodes
+```
+
+**Why:**
+- `--control-plane` tells kubeadm to run the API server, scheduler, controller manager and an **etcd member** on this node, not just a kubelet.
+- `--certificate-key` decrypts the CA bundle uploaded in Step 3. Without it the node cannot become a control plane.
+- `--discovery-token-ca-cert-hash` lets the joining node verify it is talking to the genuine cluster and not an impostor.
+- Join masters **one at a time**. etcd adds members sequentially. Adding two at once can temporarily break quorum and fail the join.
+
+---
+
+## 10. Step 6 — Join the workers
+
+> **Run on:** worker1, worker2 (and any future workers)
+
+Use the **worker join command** saved in Step 3.2 (the one without `--control-plane` and `--certificate-key`):
+
+```bash
+sudo kubeadm join k8s-api.corp.example.com:8443 --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash>
+```
+
+Do **not** configure kubectl on workers; administration is done from masters or your workstation.
+
+**Why:** Without the control-plane flags, kubeadm only configures the kubelet and kube-proxy and registers the node. Calico starts a `calico-node` pod on it automatically. Workers do not run etcd or the API server; they only run your application pods.
+
+---
+
+## 11. Step 7 — Verify the cluster
+
+> **Run on:** any ONE master (master1 is fine)
+
+### 7.1 Nodes and system pods
+
+```bash
+kubectl get nodes -o wide
+```
+
+Expected: 5 nodes, all `Ready`; masters show `ROLES = control-plane`.
+
+```bash
+kubectl get pods -n kube-system
+```
+
+Expected: three each of `etcd-*`, `kube-apiserver-*`, `kube-controller-manager-*`, `kube-scheduler-*`; `coredns-*` and `kube-proxy-*` all `Running`.
+
+```bash
+kubectl get pods -n calico-system -o wide
+```
+
+Expected: one `calico-node-*` per node (5 total), all `Running`.
+
+### 7.2 etcd quorum
+
+```bash
+kubectl -n kube-system exec etcd-master1.corp.example.com -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint status --cluster -w table
+```
+
+Expected: 3 members, exactly one with `IS LEADER = true`.
+
+**Why:** The API servers are stateless; etcd is what must survive a failure. Three members with a leader proves replication works.
+
+### 7.3 Pod networking, Services and DNS
+
+```bash
+kubectl create deployment nginx --image=nginx --replicas=3
+kubectl expose deployment nginx --port=80 --type=NodePort
+kubectl get pods -o wide                     # pods spread across workers
+kubectl run test --rm -it --image=busybox -- sh -c \
+  'wget -qO- nginx | head -3; nslookup k8s-api.corp.example.com'
+```
+
+Expected: HTML from nginx (proves pod-to-pod routing through Calico and Service resolution) and the VIP from `nslookup` (proves pods can reach your organisation's DNS through CoreDNS).
+
+Clean up:
+
+```bash
+kubectl delete deployment nginx
+kubectl delete service nginx
+```
+
+### 7.4 Control-plane failover test
+
+```bash
+# master1:
+sudo poweroff
+
+# master2:
+ip a | grep 192.168.1.100        # VIP has moved here
+kubectl get nodes                # still works; master1 shows NotReady
+kubectl get pods -n kube-system  # etcd-master1 gone, cluster still serving
+```
+
+Power master1 back on. Within about a minute it rejoins and returns to `Ready`; the VIP moves back because master1 has the highest priority.
+
+**Why:** This is the whole point of the design. If this test fails, do not put workloads on the cluster until it passes.
+
+---
+
+## 12. Step 8 — Access from your workstation
+
+> **Run on:** your laptop or admin workstation
+
+Your workstation already uses the organisation DNS, so `k8s-api.corp.example.com` resolves.
+
+```bash
+# install kubectl (Linux/macOS example; Windows: use winget or choco)
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# copy the admin kubeconfig from any master
+mkdir -p ~/.kube
+scp <user>@master1.corp.example.com:/etc/kubernetes/admin.conf ~/.kube/config
+chmod 600 ~/.kube/config
+kubectl get nodes
+```
+
+**Why:** `admin.conf` already points at `k8s-api.corp.example.com:8443`, so no edits are needed. Treat this file as a root password; it has full cluster-admin rights. For other team members create individual users with RBAC instead of sharing it.
+
+---
+
+## 13. Troubleshooting
+
+> **Run on:** as indicated
+
+### Join token expired (24 h) — any master
+
+```bash
+kubeadm token create --print-join-command
+```
+
+Prints a fresh **worker** join command.
+
+### Certificate key expired (2 h) — any master
+
+```bash
+sudo kubeadm init phase upload-certs --upload-certs
+```
+
+Prints a new key. Build the control-plane join command as:
+`<worker join command from above> --control-plane --certificate-key <new key>`
+
+### Node stuck `NotReady` — on that node
+
+```bash
+sudo journalctl -u kubelet -f
+```
+
+Common causes: swap came back on (`swapon --show` should print nothing), containerd not using `SystemdCgroup = true`, Calico pod not running on that node (`kubectl -n calico-system get pods -o wide`).
+
+### Pods on different nodes cannot talk — any master
+
+```bash
+kubectl -n calico-system logs -l k8s-app=calico-node --tail=50
+```
+
+Usually ports 179/tcp or 4789/udp blocked between nodes, or `custom-resources.yaml` CIDR not matching `--pod-network-cidr`.
+
+### VIP appears on two masters at once — masters
+
+VRRP (IP protocol 112) is being blocked between the masters by a firewall or by the hypervisor's port security. Allow it, or on VMware/Proxmox enable promiscuous mode / disable MAC filtering on the vSwitch.
+
+### Wipe a node and redo its join — on that node
+
+```bash
+sudo kubeadm reset -f
+sudo rm -rf /etc/cni/net.d $HOME/.kube
+sudo iptables -F && sudo iptables -t nat -F && sudo iptables -X
+sudo systemctl restart containerd
+```
+
+Then run the join command again. `reset` leaves Calico's CNI config in `/etc/cni/net.d`; removing it prevents the node from rejoining with stale network settings.
+
+### Removing a master permanently — any surviving master
+
+```bash
+kubectl drain master3.corp.example.com --ignore-daemonsets --delete-emptydir-data
+kubectl delete node master3.corp.example.com
+# then on master3 itself: sudo kubeadm reset -f   (this also removes its etcd member)
+```
+
+---
+
+## 14. Reference: ports
+
+| Node type | Port | Protocol | Used by |
+|---|---|---|---|
+| Masters | 6443 | TCP | kube-apiserver |
+| Masters | 8443 | TCP | HAProxy front end (API via VIP) |
+| Masters | 2379-2380 | TCP | etcd client and peer |
+| Masters | 10250 | TCP | kubelet API |
+| Masters | 10257 | TCP | kube-controller-manager |
+| Masters | 10259 | TCP | kube-scheduler |
+| Masters | 112 (protocol) | VRRP | keepalived, multicast 224.0.0.18 |
+| Workers | 10250 | TCP | kubelet API |
+| Workers | 30000-32767 | TCP | NodePort services |
+| All | 179 | TCP | Calico BGP |
+| All | 4789 | UDP | Calico VXLAN |
+| All | 5473 | TCP | Calico Typha |
+| All | 53 | TCP/UDP | outbound to organisation DNS |
+
+---
+
+## 15. Reference: how to add a node later
+
+**Add a worker:**
+1. Step 1 (all of it) on the new machine, with its own hostname and IP.
+2. Ask DNS team for its A and PTR records.
+3. On any master: `kubeadm token create --print-join-command`.
+4. Run that command on the new worker.
+
+**Add a master (going from 3 to 5):**
+1. Step 1 and Step 2 on the new machine; add it to the HAProxy backend list on all masters and reload HAProxy.
+2. DNS records as above.
+3. On any master: `kubeadm token create --print-join-command` and `sudo kubeadm init phase upload-certs --upload-certs`.
+4. Combine into the control-plane join command and run it on the new master.
+
+Always keep an odd number of masters (3 or 5).
+
+---
+
+*Versions in this guide: Kubernetes v1.36 line, Calico v3.32.2, Ubuntu 22.04/24.04. Check the links in section 2 for current releases before installing.*
